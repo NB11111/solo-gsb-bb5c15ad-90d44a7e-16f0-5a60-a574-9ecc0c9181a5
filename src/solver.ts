@@ -283,6 +283,16 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/**
+ * 判断对象自身（非原型链继承）是否具有该键。
+ * 拓扑允许阀门编号 / 出口名为 toString、constructor、__proto__ 等特殊字符串，
+ * 直接以 obj[key] === undefined 判缺会把 Object.prototype 的继承成员误当作映射，
+ * 因此读取 JSON 键映射时只认 JSON 实际提供的自身键。
+ */
+function hasOwnKey(obj: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 function asStringArray(v: unknown): string[] | null {
   if (!Array.isArray(v)) return null;
   if (!v.every((x) => typeof x === 'string' && x.length > 0)) return null;
@@ -2243,7 +2253,9 @@ export function parseWorkPassage(raw: unknown): { passage?: WorkPassage; errors:
     });
   }
 
-  const valveWaypoints: Record<string, string> = {};
+  // 键来自用户 JSON，可能含 "__proto__" 等特殊名称：
+  // 以 null 原型对象承载，避免赋值触发原型访问器而丢失映射。
+  const valveWaypoints: Record<string, string> = Object.create(null) as Record<string, string>;
   if (!isRecord(raw.valveWaypoints)) {
     errors.push('valveWaypoints 必须是对象：键为阀门编号，值为该阀门作业所在路点。');
   } else {
@@ -2299,8 +2311,9 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
   // 必访阀门：去重后按编号升序（位编号顺序，与字典序取舍一致）
   const required = [...new Set(query.closedValves)].sort();
 
-  // 映射缺失
-  const missingValves = required.filter((v) => passage.valveWaypoints[v] === undefined);
+  // 映射缺失：只认 valveWaypoints 自身实际提供的键，
+  // 不把 toString / constructor 等继承属性误判为映射
+  const missingValves = required.filter((v) => !hasOwnKey(passage.valveWaypoints, v));
   if (missingValves.length > 0) {
     return {
       status: 'missing-map',
@@ -2419,7 +2432,8 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
   };
 
   const n = required.length;
-  const valveWaypointsResult: Record<string, string> = {};
+  // 结果映射同样以 null 原型承载，特殊阀门编号（如 "__proto__"）下供页面安全读取
+  const valveWaypointsResult: Record<string, string> = Object.create(null) as Record<string, string>;
   required.forEach((v) => {
     valveWaypointsResult[v] = passage.valveWaypoints[v];
   });
@@ -2746,7 +2760,7 @@ export function planEmergencyDeliveryStations(
     errors.push(`最大步行分钟必须是非负整数（收到：${String(query.maxWalkMinutes)}）。`);
   }
 
-  if (!query.outletWaypoints || typeof query.outletWaypoints !== 'object' || Array.isArray(query.outletWaypoints)) {
+  if (!isRecord(query.outletWaypoints)) {
     errors.push('出口到路点的 JSON 映射必须是对象：键为保供出口名，值为该出口取水口所在路点。');
   }
 
@@ -2760,23 +2774,29 @@ export function planEmergencyDeliveryStations(
       errors.push(`送水站「${name}」所在路点未在作业通道 JSON 的 waypoints 中声明。`);
     }
   }
-  if (query.outletWaypoints && typeof query.outletWaypoints === 'object' && !Array.isArray(query.outletWaypoints)) {
+  // 只收集 JSON 实际提供的自身键值（Object.entries 同样能给出 "__proto__" 键），
+  // 后续路径计算一律从该 Map 取水口路点，绝不向普通对象按继承属性取值
+  const outletWaypointMap = new Map<string, string>();
+  if (isRecord(query.outletWaypoints)) {
     for (const [outlet, wp] of Object.entries(query.outletWaypoints)) {
       if (typeof wp !== 'string' || !wp.trim()) {
         errors.push(`保供出口「${outlet}」映射的取水口路点必须是非空字符串。`);
         continue;
       }
-      if (!wpSet.has(wp.trim())) {
-        errors.push(`保供出口「${outlet}」的取水口路点「${wp.trim()}」未在作业通道 JSON 的 waypoints 中声明。`);
+      const wpName = wp.trim();
+      if (!wpSet.has(wpName)) {
+        errors.push(`保供出口「${outlet}」的取水口路点「${wpName}」未在作业通道 JSON 的 waypoints 中声明。`);
       }
       if (!needOutletSet.has(outlet) && !capacity.rows.some((r) => r.outlet === outlet)) {
         errors.push(`出口到路点映射中的「${outlet}」不在保供出口名单中。`);
+      } else {
+        outletWaypointMap.set(outlet, wpName);
       }
       // 已足额（缺口为 0）的出口映射多余，忽略，不报错
     }
     for (const r of needRows) {
-      const wp = query.outletWaypoints[r.outlet];
-      if (wp === undefined) {
+      // 只认映射对象自身实际提供的键，toString / constructor 等继承属性不算映射
+      if (!hasOwnKey(query.outletWaypoints, r.outlet)) {
         errors.push(`存在缺口的保供出口「${r.outlet}」缺少出口到路点映射，请在 JSON 中补充其取水口路点。`);
       }
     }
@@ -2788,7 +2808,7 @@ export function planEmergencyDeliveryStations(
     .sort((a, b) => compareNameLists([a.name], [b.name]));
   const maxWalk = query.maxWalkMinutes as number;
   const outletWaypointOf = new Map<string, string>(
-    needRows.map((r) => [r.outlet, (query.outletWaypoints as Record<string, string>)[r.outlet].trim()])
+    needRows.map((r) => [r.outlet, outletWaypointMap.get(r.outlet)!])
   );
 
   // 3) 作业通道最短步行距离与「站 → 出口」可服务关系

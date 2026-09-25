@@ -1314,6 +1314,51 @@ check('路线测算不修改拓扑', JSON.stringify(routeNet) === beforeRouteNet
 check('路线测算不修改作业通道输入', JSON.stringify(passage) === beforeRoutePsg);
 check('路线测算不修改待关闭阀门入参数组', closedInput.join(',') === 'V2,V1');
 
+console.log('作业路线：特殊名称（toString / constructor / __proto__）不被原型属性误判：');
+// 拓扑允许阀门编号取特殊字符串；JSON.parse 对 "__proto__" 键按普通自有数据属性建立
+const specialNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'toString', from: 'S', to: 'O', open: true },
+    { id: 'constructor', from: 'S', to: 'O', open: true },
+    { id: '__proto__', from: 'S', to: 'O', open: true },
+  ],
+};
+const specialEmptyPsg = solver.parseWorkPassage(
+  JSON.parse('{"waypoints":["大门","X"],"passages":[{"from":"大门","to":"X","minutes":2}],"valveWaypoints":{}}')
+);
+check('缺映射的特殊名通道解析成功', specialEmptyPsg.errors.length === 0 && !!specialEmptyPsg.passage);
+for (const specialValve of ['toString', 'constructor', '__proto__']) {
+  const miss = solver.planClosureRoute({
+    network: specialNet,
+    closedValves: [specialValve],
+    passage: specialEmptyPsg.passage,
+    start: '大门',
+  });
+  check(`阀门「${specialValve}」缺映射返回 missing-map 而非抛错`,
+    miss.status === 'missing-map' && miss.missingValves.join(',') === specialValve &&
+    miss.reason.includes(specialValve));
+}
+// 显式配置这些名称时仍可正确计算（大门→X 2 分钟，往返 4）
+for (const specialValve of ['toString', 'constructor', '__proto__']) {
+  const parsed = solver.parseWorkPassage(
+    JSON.parse(`{"waypoints":["大门","X"],"passages":[{"from":"大门","to":"X","minutes":2}],"valveWaypoints":{"${specialValve}":"X"}}`)
+  );
+  check(`显式配置阀门「${specialValve}」映射时解析保留该键`,
+    parsed.errors.length === 0 &&
+    Object.prototype.hasOwnProperty.call(parsed.passage.valveWaypoints, specialValve));
+  const ok = solver.planClosureRoute({
+    network: specialNet,
+    closedValves: [specialValve],
+    passage: parsed.passage,
+    start: '大门',
+  });
+  check(`阀门「${specialValve}」显式映射可完成路线（总耗时 4）`,
+    ok.status === 'ok' && ok.totalMinutes === 4 && ok.valveOrder.join(',') === specialValve &&
+    ok.valveWaypoints[specialValve] === 'X');
+}
+
 // ============ 应急送水站布点 ============
 console.log('应急送水站布点：');
 
@@ -1516,6 +1561,44 @@ const d13 = solver.planEmergencyDeliveryStations(delNet, {
   stations: [{ name: 'gate', capacity: 5 }],
 });
 check('出口节点不存在时透传核验错误', d13.status === 'invalid');
+
+console.log('应急送水站布点：特殊出口名（toString / constructor / __proto__）不误判继承属性：');
+// 保供出口允许取特殊名称；缺出口取水口映射时必须返回可展示错误而非抛错
+for (const specialOutlet of ['toString', 'constructor', '__proto__']) {
+  const specialNet = {
+    nodes: ['S', specialOutlet],
+    pipes: [],
+    valvedPipes: [{ id: 'V1', from: 'S', to: specialOutlet, open: true }],
+  };
+  const specialQuery = {
+    supplies: ['S'],
+    outlets: [specialOutlet],
+    supplyCaps: { S: 5 },
+    // 字面量中的 "__proto__" 会成为原型设置而非自有键，用 JSON.parse 按自有键建立
+    outletDemands: JSON.parse(`{"${specialOutlet}":3}`),
+    passage: { waypoints: ['gate', 'w'], passages: [{ from: 'gate', to: 'w', minutes: 1 }], valveWaypoints: {} },
+    maxWalkMinutes: 1,
+    outletWaypoints: JSON.parse('{}'),
+    stations: [{ name: 'gate', capacity: 5 }],
+  };
+  const miss = solver.planEmergencyDeliveryStations(specialNet, specialQuery);
+  check(`出口「${specialOutlet}」缺取水口映射报可展示错误且不抛错`,
+    miss.status === 'invalid' &&
+    miss.errors.some((e) => e.includes(specialOutlet) && e.includes('缺少出口到路点映射')));
+
+  // 显式配置映射时服务范围与整数分配均正确（缺口 2，gate→w 1 分钟可服务）
+  const okQuery = {
+    ...specialQuery,
+    outletWaypoints: JSON.parse(`{"${specialOutlet}":"w"}`),
+  };
+  const ok = solver.planEmergencyDeliveryStations(specialNet, okQuery);
+  check(`出口「${specialOutlet}」显式映射可布点：1 站补齐 2`,
+    ok.status === 'ok' && ok.stationUsed === 1 && ok.totalDelivered === 2 &&
+    ok.rows.length === 1 && ok.rows[0].outlet === specialOutlet &&
+    ok.rows[0].waypoint === 'w' && ok.rows[0].remaining === 0 &&
+    ok.rows[0].byStation.length === 1 && ok.rows[0].byStation[0].station === 'gate' &&
+    ok.rows[0].byStation[0].amount === 2 && ok.rows[0].byStation[0].walkMinutes === 1);
+}
 
 // ============ 检修阀门操作时段审计 ============
 console.log('检修阀门操作时段审计：');
