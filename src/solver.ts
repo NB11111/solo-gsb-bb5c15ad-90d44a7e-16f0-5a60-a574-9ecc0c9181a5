@@ -283,6 +283,23 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/**
+ * 只认对象自身（JSON 实际提供）的键：阀门编号 / 出口名允许取
+ * 「toString」「constructor」「__proto__」等字符串，不能把原型链上的
+ * 继承属性误判为已提供的映射。
+ */
+function hasOwnKey(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+/**
+ * 建立无原型的键值表：向其中写入「__proto__」等键只会形成普通自有属性，
+ * 不会触发原型设置器；读取时也不会命中 toString 等继承属性。
+ */
+function createNullProtoRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 function asStringArray(v: unknown): string[] | null {
   if (!Array.isArray(v)) return null;
   if (!v.every((x) => typeof x === 'string' && x.length > 0)) return null;
@@ -943,7 +960,7 @@ function validateCapacityQuery(
   const supplyCapList: { supply: string; cap: number }[] = [];
   for (const s of supplies) {
     if (!nodeSet.has(s)) continue;
-    const raw = query.supplyCaps[s];
+    const raw = hasOwnKey(query.supplyCaps, s) ? query.supplyCaps[s] : undefined;
     if (raw === undefined) {
       errors.push(`供水点「${s}」缺少供给上限，请填写非负整数。`);
       continue;
@@ -959,7 +976,7 @@ function validateCapacityQuery(
   const demandList: { outlet: string; demand: number }[] = [];
   for (const o of outlets) {
     if (!nodeSet.has(o)) continue;
-    const raw = query.outletDemands[o];
+    const raw = hasOwnKey(query.outletDemands, o) ? query.outletDemands[o] : undefined;
     if (raw === undefined) {
       errors.push(`保供出口「${o}」缺少需求量，请填写非负整数。`);
       continue;
@@ -2243,7 +2260,8 @@ export function parseWorkPassage(raw: unknown): { passage?: WorkPassage; errors:
     });
   }
 
-  const valveWaypoints: Record<string, string> = {};
+  // 无原型键值表：键为用户给出的阀门编号，允许为 __proto__ 等特殊名称
+  const valveWaypoints: Record<string, string> = createNullProtoRecord<string>();
   if (!isRecord(raw.valveWaypoints)) {
     errors.push('valveWaypoints 必须是对象：键为阀门编号，值为该阀门作业所在路点。');
   } else {
@@ -2299,8 +2317,8 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
   // 必访阀门：去重后按编号升序（位编号顺序，与字典序取舍一致）
   const required = [...new Set(query.closedValves)].sort();
 
-  // 映射缺失
-  const missingValves = required.filter((v) => passage.valveWaypoints[v] === undefined);
+  // 映射缺失：只认 JSON 实际提供的键，继承属性（toString 等）不算映射
+  const missingValves = required.filter((v) => !hasOwnKey(passage.valveWaypoints, v));
   if (missingValves.length > 0) {
     return {
       status: 'missing-map',
@@ -2419,7 +2437,7 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
   };
 
   const n = required.length;
-  const valveWaypointsResult: Record<string, string> = {};
+  const valveWaypointsResult: Record<string, string> = createNullProtoRecord<string>();
   required.forEach((v) => {
     valveWaypointsResult[v] = passage.valveWaypoints[v];
   });
@@ -2431,7 +2449,7 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
       start: startWp,
       requiredValveCount: 0,
       valveOrder: [],
-      valveWaypoints: {},
+      valveWaypoints: createNullProtoRecord<string>(),
       segments: [],
       totalMinutes: 0,
     };
@@ -2746,8 +2764,11 @@ export function planEmergencyDeliveryStations(
     errors.push(`最大步行分钟必须是非负整数（收到：${String(query.maxWalkMinutes)}）。`);
   }
 
-  if (!query.outletWaypoints || typeof query.outletWaypoints !== 'object' || Array.isArray(query.outletWaypoints)) {
+  let outletWaypointsValid = false;
+  if (!isRecord(query.outletWaypoints)) {
     errors.push('出口到路点的 JSON 映射必须是对象：键为保供出口名，值为该出口取水口所在路点。');
+  } else {
+    outletWaypointsValid = true;
   }
 
   // 仅有待送水量 > 0 的出口参与布点
@@ -2760,24 +2781,37 @@ export function planEmergencyDeliveryStations(
       errors.push(`送水站「${name}」所在路点未在作业通道 JSON 的 waypoints 中声明。`);
     }
   }
-  if (query.outletWaypoints && typeof query.outletWaypoints === 'object' && !Array.isArray(query.outletWaypoints)) {
-    for (const [outlet, wp] of Object.entries(query.outletWaypoints)) {
+  // 清洗后的出口取水口映射（无原型键值表，允许 __proto__ 等特殊出口名）
+  const outletWaypointMap: Record<string, string> = createNullProtoRecord<string>();
+  // 路点值非法的出口：不再重复报「缺少映射」
+  const invalidWaypointOutlets = new Set<string>();
+  if (outletWaypointsValid) {
+    const rawOutletWaypoints = query.outletWaypoints;
+    for (const [outlet, wp] of Object.entries(rawOutletWaypoints)) {
       if (typeof wp !== 'string' || !wp.trim()) {
         errors.push(`保供出口「${outlet}」映射的取水口路点必须是非空字符串。`);
+        invalidWaypointOutlets.add(outlet);
         continue;
       }
-      if (!wpSet.has(wp.trim())) {
-        errors.push(`保供出口「${outlet}」的取水口路点「${wp.trim()}」未在作业通道 JSON 的 waypoints 中声明。`);
+      const trimmedWp = wp.trim();
+      if (!wpSet.has(trimmedWp)) {
+        errors.push(`保供出口「${outlet}」的取水口路点「${trimmedWp}」未在作业通道 JSON 的 waypoints 中声明。`);
+        invalidWaypointOutlets.add(outlet);
+        continue;
       }
       if (!needOutletSet.has(outlet) && !capacity.rows.some((r) => r.outlet === outlet)) {
         errors.push(`出口到路点映射中的「${outlet}」不在保供出口名单中。`);
       }
       // 已足额（缺口为 0）的出口映射多余，忽略，不报错
+      outletWaypointMap[outlet] = trimmedWp;
     }
     for (const r of needRows) {
-      const wp = query.outletWaypoints[r.outlet];
-      if (wp === undefined) {
-        errors.push(`存在缺口的保供出口「${r.outlet}」缺少出口到路点映射，请在 JSON 中补充其取水口路点。`);
+      if (!hasOwnKey(outletWaypointMap, r.outlet)) {
+        errors.push(
+          invalidWaypointOutlets.has(r.outlet)
+            ? `存在缺口的保供出口「${r.outlet}」的取水口路点映射无效，请修正后重新规划。`
+            : `存在缺口的保供出口「${r.outlet}」缺少出口取水口路点映射，请在 JSON 中补充其取水口路点。`
+        );
       }
     }
   }
@@ -2788,7 +2822,7 @@ export function planEmergencyDeliveryStations(
     .sort((a, b) => compareNameLists([a.name], [b.name]));
   const maxWalk = query.maxWalkMinutes as number;
   const outletWaypointOf = new Map<string, string>(
-    needRows.map((r) => [r.outlet, (query.outletWaypoints as Record<string, string>)[r.outlet].trim()])
+    needRows.map((r) => [r.outlet, outletWaypointMap[r.outlet]])
   );
 
   // 3) 作业通道最短步行距离与「站 → 出口」可服务关系

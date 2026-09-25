@@ -1703,5 +1703,130 @@ check('审计不修改拓扑与登记状态', JSON.stringify(network) === before
 check('审计不修改入参记录', auditRecordsInput.length === 2 &&
   auditRecordsInput[0].minute === 5 && auditRecordsInput[0].open === false);
 
+// ============ 特殊名称（toString / constructor / __proto__）防护 ============
+console.log('特殊名称：阀门编号为继承属性名时不误判路点映射：');
+// 拓扑允许阀门编号取 toString / constructor / __proto__ 等字符串
+const specialRouteNet = {
+  nodes: ['g', 'w'],
+  pipes: [],
+  valvedPipes: ['toString', 'constructor', '__proto__'].map((id) => ({
+    id, from: 'g', to: 'w', open: true,
+  })),
+};
+// 经 JSON.parse 构造（与页面一致）：一个映射都没有
+const specialPsgEmpty = solver.parseWorkPassage(JSON.parse(JSON.stringify({
+  waypoints: ['大门', '井A'],
+  passages: [{ from: '大门', to: '井A', minutes: 3 }],
+  valveWaypoints: {},
+})));
+check('空 valveWaypoints 解析成功', specialPsgEmpty.errors.length === 0 && !!specialPsgEmpty.passage);
+for (const v of ['toString', 'constructor', '__proto__']) {
+  const r = solver.planClosureRoute({
+    network: specialRouteNet, closedValves: [v], passage: specialPsgEmpty.passage, start: '大门',
+  });
+  check(`缺失「${v}」映射返回 missing-map（不抛错）`,
+    r.status === 'missing-map' && r.missingValves.join(',') === v);
+}
+// 三个同时缺失：全部按编号列出
+const rAllMiss = solver.planClosureRoute({
+  network: specialRouteNet,
+  closedValves: ['toString', 'constructor', '__proto__'],
+  passage: specialPsgEmpty.passage,
+  start: '大门',
+});
+check('多个特殊名称阀门缺失时全部列出',
+  rAllMiss.status === 'missing-map' && rAllMiss.missingValves.length === 3);
+
+// 显式配置这些名称的映射：经 JSON.parse 得到真实自有键（含 __proto__）
+const specialPsgFull = solver.parseWorkPassage(JSON.parse(
+  '{"waypoints":["大门","井A"],' +
+  '"passages":[{"from":"大门","to":"井A","minutes":3}],' +
+  '"valveWaypoints":{"toString":"井A","constructor":"井A","__proto__":"井A"}}'
+));
+check('特殊名称映射全部被识别为实际提供的键',
+  specialPsgFull.errors.length === 0 &&
+  ['toString', 'constructor', '__proto__'].every((k) =>
+    Object.keys(specialPsgFull.passage.valveWaypoints).includes(k)));
+check('显式 __proto__ 键不污染映射对象原型（原型为 null）',
+  Object.getPrototypeOf(specialPsgFull.passage.valveWaypoints) === null);
+for (const v of ['toString', 'constructor', '__proto__']) {
+  const r = solver.planClosureRoute({
+    network: specialRouteNet, closedValves: [v], passage: specialPsgFull.passage, start: '大门',
+  });
+  check(`显式配置「${v}」时关阀步行路线可计算（往返 6 分钟）`,
+    r.status === 'ok' && r.totalMinutes === 6 &&
+    r.segments[0].path.join('→') === '大门→井A' &&
+    r.valveWaypoints[v] === '井A');
+}
+const rAllOk = solver.planClosureRoute({
+  network: specialRouteNet,
+  closedValves: ['toString', 'constructor', '__proto__'],
+  passage: specialPsgFull.passage,
+  start: '大门',
+});
+check('三个特殊名称阀门同点时路线仍可计算（总步行 6 分钟）',
+  rAllOk.status === 'ok' && rAllOk.requiredValveCount === 3 && rAllOk.totalMinutes === 6);
+// 普通名称阀门不被特殊键影响：只有 V1 映射时要求 toString 仍报缺失
+const mixedPsg = solver.parseWorkPassage({
+  waypoints: ['大门', '井A'],
+  passages: [{ from: '大门', to: '井A', minutes: 3 }],
+  valveWaypoints: { V9: '井A' },
+});
+const specialNetExtra = {
+  nodes: ['g', 'w'],
+  pipes: [],
+  valvedPipes: [{ id: 'V9', from: 'g', to: 'w', open: true }],
+};
+check('继承属性名不被当作映射（V9 有映射、toString 无映射）',
+  solver.planClosureRoute({
+    network: specialNetExtra, closedValves: ['V9'], passage: mixedPsg.passage, start: '大门',
+  }).status === 'ok');
+
+console.log('特殊名称：保供出口名为继承属性名时的送水站布点：');
+const specialDelNet = {
+  nodes: ['S', 'toString', 'constructor', '__proto__'],
+  pipes: [],
+  valvedPipes: [],
+};
+const specialDelQuery = (outletWaypointsText, maxWalkMinutes = 6) => ({
+  supplies: ['S'],
+  outlets: ['toString', 'constructor', '__proto__'],
+  supplyCaps: { S: 0 },
+  // 经 JSON.parse 构造，使 __proto__ 成为真实自有键
+  outletDemands: JSON.parse('{"toString":3,"constructor":3,"__proto__":3}'),
+  stations: [{ name: '大门', capacity: 20 }],
+  maxWalkMinutes,
+  outletWaypoints: JSON.parse(outletWaypointsText),
+  passage: specialPsgFull.passage,
+});
+// 缺项：空映射对象上读取 toString / constructor / __proto__ 不得命中继承属性
+const sd1 = solver.planEmergencyDeliveryStations(specialDelNet, specialDelQuery('{}'));
+check('三个特殊名称出口缺映射均报可展示错误（不抛错）',
+  sd1.status === 'invalid' &&
+  sd1.errors.length === 3 &&
+  sd1.errors.every((e) => e.includes('缺少出口取水口路点映射')) &&
+  sd1.errors.some((e) => e.includes('toString')) &&
+  sd1.errors.some((e) => e.includes('constructor')) &&
+  sd1.errors.some((e) => e.includes('__proto__')));
+// 显式配置：服务范围与整数分配均可计算
+const sd2 = solver.planEmergencyDeliveryStations(
+  specialDelNet,
+  specialDelQuery('{"toString":"井A","constructor":"井A","__proto__":"井A"}')
+);
+check('显式配置特殊名称出口映射：单站补齐全部 9 个单位',
+  sd2.status === 'ok' && sd2.stationUsed === 1 && sd2.totalNeed === 9 &&
+  sd2.totalDelivered === 9 &&
+  sd2.rows.length === 3 &&
+  sd2.rows.every((r) => r.remaining === 0 && r.waypoint === '井A' &&
+    r.byStation.length === 1 && r.byStation[0].walkMinutes === 3));
+// 步行受限：站到取水口 3 分钟，最大步行 1 → 全部不可服务
+const sd3 = solver.planEmergencyDeliveryStations(
+  specialDelNet,
+  specialDelQuery('{"toString":"井A","constructor":"井A","__proto__":"井A"}', 1)
+);
+check('特殊名称出口超出步行服务范围时列入未补齐',
+  sd3.status === 'unsolvable' && sd3.totalDelivered === 0 &&
+  sd3.uncoveredOutlets.length === 3);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

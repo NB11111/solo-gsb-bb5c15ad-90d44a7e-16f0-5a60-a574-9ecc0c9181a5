@@ -503,6 +503,19 @@ function renderErrors(target: HTMLElement, title: string, errors: string[]): voi
     </ul>`;
 }
 
+/**
+ * 渲染各操作 catch 到的错误：readNetwork 抛出的拓扑错误按原样展示；
+ * 其余意外错误也要在结果区给出可展示信息，避免结果区因异常而不可用。
+ */
+function renderCaughtError(target: HTMLElement, e: unknown): void {
+  const topologyErrors = (e as { topologyErrors?: unknown } | null)?.topologyErrors;
+  if (Array.isArray(topologyErrors) && topologyErrors.every((x) => typeof x === 'string')) {
+    renderErrors(target, '拓扑校验失败：', topologyErrors as string[]);
+    return;
+  }
+  renderErrors(target, '操作失败：', [e instanceof Error ? e.message : String(e)]);
+}
+
 function renderResult(result: SolveResult, query: Query): void {
   lastSolveResult = result;
   if (result.status === 'invalid') {
@@ -718,8 +731,9 @@ function readCapacityNumbers(): {
   priorityOutlets: string[];
   errors: string[];
 } {
-  const supplyCaps: Record<string, number> = {};
-  const outletDemands: Record<string, number> = {};
+  // 使用无原型对象承载数值：节点名允许为 toString / constructor / __proto__ 等特殊字符串
+  const supplyCaps: Record<string, number> = Object.create(null) as Record<string, number>;
+  const outletDemands: Record<string, number> = Object.create(null) as Record<string, number>;
   const priorityOutlets: string[] = [];
   const errors: string[] = [];
   if (!capacityFormState) {
@@ -791,7 +805,8 @@ function buildDeliveryForm(stations: string[], prevCaps?: Record<string, number>
 
 /** 读取候选站可送水量填写表（留空按 0）；返回错误信息列表。 */
 function readDeliveryNumbers(): { caps: Record<string, number>; errors: string[] } {
-  const caps: Record<string, number> = {};
+  // 无原型对象：站名允许为 toString / constructor / __proto__ 等特殊字符串
+  const caps: Record<string, number> = Object.create(null) as Record<string, number>;
   const errors: string[] = [];
   if (!deliveryFormState) return { caps, errors: ['请先生成候选站可送水量填写表。'] };
   deliveryFormEl.querySelectorAll<HTMLInputElement>('input[data-station]').forEach((input) => {
@@ -1764,7 +1779,7 @@ function run(): void {
     const { network, query } = readQuery();
     renderResult(solve(network, query), query);
   } catch (e) {
-    renderErrors(resultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(resultEl, e);
   }
 }
 
@@ -1773,7 +1788,7 @@ function runInspection(): void {
     const { network, query } = readQuery();
     renderInspection(inspectResilience(network, query));
   } catch (e) {
-    renderErrors(inspectResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(inspectResultEl, e);
   }
 }
 
@@ -1798,7 +1813,7 @@ function runCapacity(): void {
     };
     renderCapacity(verifyCapacity(network, capacityQuery));
   } catch (e) {
-    renderErrors(capacityResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(capacityResultEl, e);
   }
 }
 
@@ -1823,7 +1838,7 @@ function runExpansion(): void {
     };
     renderExpansion(suggestExpansion(network, capacityQuery));
   } catch (e) {
-    renderErrors(expansionResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(expansionResultEl, e);
   }
 }
 
@@ -1848,7 +1863,7 @@ function runValveRisk(): void {
     };
     renderValveRisk(scanValveClosureRisk(network, capacityQuery));
   } catch (e) {
-    renderErrors(valveRiskResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(valveRiskResultEl, e);
   }
 }
 
@@ -1873,7 +1888,7 @@ function runReopenPlan(): void {
     };
     renderReopenPlan(planReopenSequence(network, capacityQuery));
   } catch (e) {
-    renderErrors(reopenResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(reopenResultEl, e);
   }
 }
 
@@ -1899,7 +1914,7 @@ function runPriorityCapacity(): void {
     };
     renderPriorityCapacity(verifyPriorityCapacity(network, capacityQuery));
   } catch (e) {
-    renderErrors(priorityResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(priorityResultEl, e);
   }
 }
 
@@ -1914,7 +1929,7 @@ function runAnomaly(): void {
     };
     renderAnomaly(locateValveAnomalies(network, anomalyQuery));
   } catch (e) {
-    renderErrors(anomalyResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(anomalyResultEl, e);
   }
 }
 
@@ -1928,7 +1943,7 @@ function runObserverPlan(): void {
     };
     renderObserverPlan(planSingleValveObservers(network, observerQuery));
   } catch (e) {
-    renderErrors(observerResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(observerResultEl, e);
   }
 }
 
@@ -1962,7 +1977,7 @@ function runClosureRoute(): void {
       })
     );
   } catch (e) {
-    renderErrors(closureRouteResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(closureRouteResultEl, e);
   }
 }
 
@@ -2035,7 +2050,7 @@ function runDeliveryPlan(): void {
       })
     );
   } catch (e) {
-    renderErrors(deliveryResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(deliveryResultEl, e);
   }
 }
 
@@ -2074,7 +2089,7 @@ function runValveAudit(): void {
       })
     );
   } catch (e) {
-    renderErrors(valveAuditResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(valveAuditResultEl, e);
   }
 }
 
@@ -2157,7 +2172,7 @@ el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点
   } catch (e) {
-    renderErrors(capacityResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    renderCaughtError(capacityResultEl, e);
     return;
   }
   const supplies = [...new Set(splitList(suppliesEl.value))];
